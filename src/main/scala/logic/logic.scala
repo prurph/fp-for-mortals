@@ -45,4 +45,48 @@ final class DynAgents[F[_]](implicit M: Monad[F], d: Drone[F], m: Machines[F]) {
 
   private def timediff(from: ZonedDateTime, to: ZonedDateTime): FiniteDuration =
     ChronoUnit.MINUTES.between(from, to).minutes
+
+  private object NeedsAgent {
+    def unapply(world: WorldView): Option[MachineNode] = world match {
+      case WorldView(backlog, 0, managed, alive, pending, _)
+          if backlog > 0 && alive.isEmpty && pending.isEmpty =>
+        Option(managed.head)
+      case _ => None
+    }
+  }
+
+  private object Stale {
+    def unapply(world: WorldView): Option[NonEmptyList[MachineNode]] =
+      world match {
+        case WorldView(backlog, _, _, alive, pending, time)
+            if alive.nonEmpty =>
+          (alive -- pending.keys)
+            .collect {
+              case (n, started)
+                  if backlog == 0 && timediff(started, time).toMinutes % 60 >= 58 =>
+                n
+              case (n, started) if timediff(started, time) >= 5.hours => n
+            }
+            .toList
+            .toNel
+        case _ => None
+      }
+  }
+
+  def act(world: WorldView): F[WorldView] = world match {
+    case NeedsAgent(node) =>
+      for {
+        _ <- m.start(node)
+        // pending was empty so the new value is just a map of this newly pending node
+        update = world.copy(pending = Map(node -> world.time))
+      } yield update
+    case Stale(nodes) =>
+      nodes.foldLeftM(world) { (world, n) =>
+        for {
+          _ <- m.stop(n)
+          update = world.copy(pending = world.pending + (n -> world.time))
+        } yield update
+      }
+    case _ => world.pure[F]
+  }
 }
